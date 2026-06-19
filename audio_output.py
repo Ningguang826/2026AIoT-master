@@ -1,5 +1,8 @@
 """
-板端音频播放模块。
+固定提示音 wav 文件播放（区分平台：Windows winsound / Linux ALSA aplay）。
+
+并提供 Linux / SC171 板端的声卡索引查找与 amixer 通路配置，
+供本模块和 streaming_tts.py 的连续 PCM 播放复用。
 """
 
 from __future__ import annotations

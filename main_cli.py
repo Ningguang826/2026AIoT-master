@@ -1,5 +1,7 @@
 """
 持续唤醒语音助手命令行入口。
+
+解析命令行参数，构造 WakeLoop 状态机并启动持续监听循环。
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ from wake_loop import WakeLoop, WakeLoopConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("websocket").setLevel(logging.WARNING)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wake-listen-seconds", type=int, default=10, help="持续监听短窗秒数")
     parser.add_argument("--wake-question-seconds", type=int, default=18, help="唤醒后正式录音硬上限秒数")
     parser.add_argument("--wake-initial-silence-seconds", type=float, default=8.0, help="唤醒后最多等待用户开口秒数")
-    parser.add_argument("--wake-end-silence-seconds", type=float, default=1.0, help="检测到本地静音多久判定输入完成")
+    parser.add_argument("--wake-end-silence-seconds", type=float, default=0.6, help="检测到本地静音多久判定输入完成")
     parser.add_argument("--wake-question-retries", type=int, default=3, help="激活后连续无有效问题时的最多重试次数")
     parser.add_argument("--wake-rounds", type=int, default=3, help="完成回答的问题轮数，0 表示一直运行")
     parser.add_argument("--exit-after-idle-return", action="store_true", help="测试用：唤醒后回到待机前退出")

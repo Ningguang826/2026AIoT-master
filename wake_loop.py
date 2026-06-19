@@ -15,7 +15,7 @@ from typing import Literal
 
 from llm_client import ChatMessage
 from settings import VoiceCliSettings
-from streaming_voice import ASRListenResult, RealtimeVoiceLoop
+from streaming_voice import ASRListenResult, RealtimeVoiceLoop, SpeculativeLLMStream
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ class WakeLoopConfig:
     listen_seconds: int = 10
     question_seconds: int = 18
     question_initial_silence_seconds: float = 8.0
-    question_end_silence_seconds: float = 1.0
+    question_end_silence_seconds: float = 0.6
     question_retry_limit: int = 3
     max_rounds: int = 3
     exit_after_idle_return: bool = False
@@ -58,6 +58,8 @@ class QuestionListenResult:
     status: QuestionListenStatus
     text: str | None = None
     utterance_end_time: float | None = None
+    endpoint_confirm_delay: float | None = None
+    prefetched_stream: SpeculativeLLMStream | None = None
 
 
 class WakeLoop:
@@ -120,7 +122,7 @@ class WakeLoop:
         dialog_history: list[ChatMessage] = []
         while self.config.max_rounds <= 0 or completed_rounds < self.config.max_rounds:
             logger.info("请说出问题或继续追问")
-            result = self._listen_user_question_once(miss_count + 1)
+            result = self._listen_user_question_once(miss_count + 1, dialog_history)
             if result.status == "empty":
                 miss_count += 1
                 logger.info(
@@ -172,6 +174,8 @@ class WakeLoop:
                 user_text,
                 history=dialog_history,
                 utterance_end_time=result.utterance_end_time,
+                asr_endpoint_confirm_delay=result.endpoint_confirm_delay,
+                prefetched_stream=result.prefetched_stream,
             )
             if not reply:
                 self.config.state = WakeState.ERROR_RECOVERY
@@ -191,27 +195,61 @@ class WakeLoop:
 
         return completed_rounds
 
-    def _listen_user_question_once(self, attempt: int) -> QuestionListenResult:
+    def _listen_user_question_once(
+        self,
+        attempt: int,
+        dialog_history: list[ChatMessage],
+    ) -> QuestionListenResult:
         logger.info(
             "开始第 %s/%s 次用户问题监听，开头静音上限 %.1f 秒",
             attempt,
             self.config.question_retry_limit,
             self.config.question_initial_silence_seconds,
         )
+        prefetched_stream: SpeculativeLLMStream | None = None
+
+        def start_prefetch(best_text: str) -> None:
+            nonlocal prefetched_stream
+            if prefetched_stream is None and self._can_speculate_from_partial(best_text):
+                prefetched_stream = self.voice_loop.start_speculative_reply(best_text, dialog_history)
+
         result = self.voice_loop.asr.listen_once(
             max_duration=self.config.question_seconds,
             initial_silence_timeout=self.config.question_initial_silence_seconds,
             end_silence_timeout=self.config.question_end_silence_seconds,
+            on_endpoint=start_prefetch,
         )
         user_text = result.text
         if not user_text:
+            if prefetched_stream:
+                prefetched_stream.discard()
             # 空麦克风输入只安静重试，不播放“没听清”，避免无人在说话时反复打扰。
             return QuestionListenResult(status="empty")
         if self._is_incomplete_starter(user_text):
+            if prefetched_stream:
+                prefetched_stream.discard()
             return self._listen_continuation(user_text, result, attempt)
         if self._is_unclear_question(user_text):
+            if prefetched_stream:
+                prefetched_stream.discard()
             return QuestionListenResult(status="unclear", text=user_text)
-        return QuestionListenResult(status="valid", text=user_text, utterance_end_time=result.utterance_end_time)
+        if prefetched_stream and prefetched_stream.is_compatible_with(user_text):
+            logger.info("投机 LLM 预取命中，终态文本: %s", user_text)
+        elif prefetched_stream:
+            logger.info(
+                "投机 LLM 预取丢弃，投机文本=%s，终态文本=%s",
+                prefetched_stream.user_text,
+                user_text,
+            )
+            prefetched_stream.discard()
+            prefetched_stream = None
+        return QuestionListenResult(
+            status="valid",
+            text=user_text,
+            utterance_end_time=result.utterance_end_time,
+            endpoint_confirm_delay=result.endpoint_confirm_delay,
+            prefetched_stream=prefetched_stream,
+        )
 
     def _listen_continuation(
         self,
@@ -237,6 +275,7 @@ class WakeLoop:
                 status="incomplete",
                 text=prefix_text,
                 utterance_end_time=prefix_result.utterance_end_time,
+                endpoint_confirm_delay=prefix_result.endpoint_confirm_delay,
             )
 
         merged_text = self._merge_question_text(prefix_text, continuation.text)
@@ -246,6 +285,7 @@ class WakeLoop:
                 status="incomplete",
                 text=merged_text,
                 utterance_end_time=continuation.utterance_end_time or prefix_result.utterance_end_time,
+                endpoint_confirm_delay=continuation.endpoint_confirm_delay or prefix_result.endpoint_confirm_delay,
             )
         if self._is_unclear_question(merged_text):
             return QuestionListenResult(status="unclear", text=merged_text)
@@ -253,6 +293,7 @@ class WakeLoop:
             status="valid",
             text=merged_text,
             utterance_end_time=continuation.utterance_end_time or prefix_result.utterance_end_time,
+            endpoint_confirm_delay=continuation.endpoint_confirm_delay or prefix_result.endpoint_confirm_delay,
         )
 
     def _has_trigger(self, text: str) -> bool:
@@ -326,6 +367,22 @@ class WakeLoop:
             "有哪",
         }
         return normalized in incomplete_starters
+
+    def _can_speculate_from_partial(self, text: str) -> bool:
+        """
+        投机预取只允许相对完整的 ASR 中间文本进入 LLM。
+
+        太短或明显像半截词的 partial 容易被最终文本推翻，既浪费一次请求，又可能在宽松
+        相似度下误命中，导致“公园/老人/室内”等关键约束被忽视。
+        """
+        normalized = self._normalize_trigger_text(text)
+        if len(normalized) < 6:
+            logger.debug("跳过投机 LLM 预取，partial 过短: %s", text)
+            return False
+        if self._is_incomplete_starter(text) or self._is_unclear_question(text):
+            logger.debug("跳过投机 LLM 预取，partial 不完整: %s", text)
+            return False
+        return True
 
     @staticmethod
     def _merge_question_text(prefix: str, continuation: str) -> str:

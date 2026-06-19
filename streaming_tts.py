@@ -20,6 +20,11 @@ from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 
+try:
+    import audioop  # Python 3.13 已按 PEP 594 移除，板端若用新版本需装 audioop-lts。
+except ImportError:  # pragma: no cover - 取决于运行环境
+    audioop = None
+
 from audio_output import get_sound_card_index, set_sound_mixer_command
 
 
@@ -30,27 +35,27 @@ logger = logging.getLogger(__name__)
 class StreamingTTSMetrics:
     llm_start_time: float = 0.0
     utterance_end_time: float | None = None
+    asr_endpoint_confirm_delay: float | None = None
     llm_first_token_time: float | None = None
+    tts_first_text_submit_time: float | None = None
     tts_first_audio_time: float | None = None
+    tts_first_non_silent_audio_time: float | None = None
     playback_first_write_time: float | None = None
     text_done_time: float | None = None
-    playback_done_time: float | None = None
 
     def log_summary(self) -> None:
         # 比赛要求显示“用户语句结束 -> TTS 播报第一个字”的时延。
-        # 这里用首次写入播放设备近似“第一个字开始播报”，比 TTS 首包更接近用户听感。
+        # 这里用“裁掉前导静音后的首个非静音 PCM 写入”近似首字真正进入播放设备，
+        # 比首包到达或 waveOut 纯入队更接近评委听到声音的起点。
         if self.utterance_end_time and self.playback_first_write_time:
             latency = max(0.0, self.playback_first_write_time - self.utterance_end_time)
             logger.info("系统响应时延 t=%.3fs，等级=%s", latency, self.competition_level(latency))
+        if self.asr_endpoint_confirm_delay is not None:
+            logger.info("ASR 端点确认延迟（用户停声->服务端句尾）: %.3fs", self.asr_endpoint_confirm_delay)
         if self.llm_first_token_time:
             logger.info("LLM 首 token 延迟: %.2fs", self.llm_first_token_time - self.llm_start_time)
-        if self.tts_first_audio_time:
-            base = self.text_done_time or self.llm_start_time
-            logger.info("TTS 首音频包延迟: %.2fs", self.tts_first_audio_time - base)
-        if self.playback_first_write_time:
-            logger.info("首次写入音频输出延迟: %.2fs", self.playback_first_write_time - self.llm_start_time)
-        if self.playback_done_time:
-            logger.info("流式 TTS 总耗时: %.2fs", self.playback_done_time - self.llm_start_time)
+        if self.tts_first_text_submit_time and self.playback_first_write_time:
+            logger.info("TTS 首片到首个非静音 PCM: %.3fs", self.playback_first_write_time - self.tts_first_text_submit_time)
 
     @staticmethod
     def competition_level(latency: float) -> str:
@@ -66,10 +71,14 @@ class StreamingTTSConfig:
     sample_rate: int = 22050
     channels: int = 1
     sample_width_bytes: int = 2
-    first_flush_chars: int = 10
+    first_flush_chars: int = 8
+    immediate_first_chunk_min_chars: int = 4
     min_flush_chars: int = 16
     long_flush_chars: int = 40
-    playback_buffer_ms: int = 120
+    immediate_first_chunk: bool = True
+    playback_buffer_ms: int = 30
+    leading_silence_probe_ms: int = 10
+    silence_rms_threshold: int = 80
     queue_timeout_seconds: float = 10.0
     linux_card_name: str = "lahainayupikiot"
     metrics: StreamingTTSMetrics = field(default_factory=StreamingTTSMetrics)
@@ -348,10 +357,21 @@ class DashScopeStreamingTTSPlayer:
         self.config = config or StreamingTTSConfig()
         self.audio_queue: queue.Queue[tuple[str, bytes | str | None]] = queue.Queue()
         self.interrupt_event = threading.Event()
+        # 预热门控：置位期间 TTS 回调丢弃一切数据/错误，使空白占位建连不污染真实播放。
+        self._warming = threading.Event()
+        # 预热完成信号：确保真实片段的 streaming_call 不与预热线程并发调用。
+        self._prewarm_done = threading.Event()
         self._playback_thread: threading.Thread | None = None
         self._player: PCMStreamPlayer | None = None
 
-    def speak_stream(self, text_stream: Iterator[str], utterance_end_time: float | None = None) -> str:
+    def speak_stream(
+        self,
+        text_stream: Iterator[str],
+        utterance_end_time: float | None = None,
+        asr_endpoint_confirm_delay: float | None = None,
+        llm_start_time: float | None = None,
+        llm_first_token_time: float | None = None,
+    ) -> str:
         if not self.api_key:
             logger.error("未配置 DASHSCOPE_API_KEY，无法执行流式 TTS")
             return ""
@@ -359,8 +379,10 @@ class DashScopeStreamingTTSPlayer:
         self.interrupt_event.clear()
         self._clear_audio_queue()
         self.config.metrics = StreamingTTSMetrics(
-            llm_start_time=time.time(),
+            llm_start_time=llm_start_time or time.time(),
             utterance_end_time=utterance_end_time,
+            asr_endpoint_confirm_delay=asr_endpoint_confirm_delay,
+            llm_first_token_time=llm_first_token_time,
         )
 
         if not self._start_playback_thread():
@@ -382,11 +404,18 @@ class DashScopeStreamingTTSPlayer:
                 def on_data(self, data: bytes) -> None:
                     if player.interrupt_event.is_set():
                         return
+                    # 预热阶段的空白占位可能回极少量静音，丢弃以免出现在真实播报之前。
+                    if player._warming.is_set():
+                        return
                     if player.config.metrics.tts_first_audio_time is None:
                         player.config.metrics.tts_first_audio_time = time.time()
                     player.audio_queue.put(("audio", bytes(data)))
 
                 def on_error(self, message) -> None:
+                    # 预热阶段的错误（如 SDK 拒绝空白调用）不应污染真实播放队列。
+                    if player._warming.is_set():
+                        logger.debug("TTS 预热阶段忽略错误: %s", message)
+                        return
                     player.audio_queue.put(("error", str(message)))
 
                 def on_complete(self) -> None:
@@ -398,6 +427,14 @@ class DashScopeStreamingTTSPlayer:
                 format=AudioFormat.PCM_22050HZ_MONO_16BIT,
                 callback=Callback(),
             )
+
+            # 预热：在等待 LLM 首 token 的空窗里后台建好 TTS websocket，
+            # 让 ~0.3s 握手与 LLM 思考时间重叠，而不是串到关键路径上。
+            self._warming.set()
+            self._prewarm_done.clear()
+            threading.Thread(
+                target=self._prewarm_connection, args=(synthesizer,), daemon=True
+            ).start()
 
             for piece in text_stream:
                 if self.interrupt_event.is_set():
@@ -411,14 +448,22 @@ class DashScopeStreamingTTSPlayer:
                     chunk, buffer = self._pop_flush_chunk(buffer, has_flushed_text)
                     if not chunk:
                         break
+                    if not has_flushed_text:
+                        self._activate_real_audio()
                     has_flushed_text = True
-                    logger.info("流式 TTS 发送文本片段: %s", chunk)
+                    logger.debug("流式 TTS 发送文本片段: %s", chunk)
+                    if self.config.metrics.tts_first_text_submit_time is None:
+                        self.config.metrics.tts_first_text_submit_time = time.time()
                     synthesizer.streaming_call(chunk)
                     with suppress(Exception):
                         synthesizer.streaming_flush()
 
             if buffer.strip() and not self.interrupt_event.is_set():
-                logger.info("流式 TTS 发送尾段: %s", buffer.strip())
+                if not has_flushed_text:
+                    self._activate_real_audio()
+                logger.debug("流式 TTS 发送尾段: %s", buffer.strip())
+                if self.config.metrics.tts_first_text_submit_time is None:
+                    self.config.metrics.tts_first_text_submit_time = time.time()
                 synthesizer.streaming_call(buffer.strip())
 
             self.config.metrics.text_done_time = time.time()
@@ -429,17 +474,39 @@ class DashScopeStreamingTTSPlayer:
             logger.error("流式 TTS 失败: %s", exc)
             self.audio_queue.put(("error", str(exc)))
         finally:
+            # 兜底解除预热门控，避免极端情况下（全程无可播文本）残留置位影响下一轮。
+            self._warming.clear()
             if self.interrupt_event.is_set() and synthesizer is not None:
                 with suppress(Exception):
                     synthesizer.close()
             self._wait_playback_done()
-            self.config.metrics.playback_done_time = time.time()
             self.config.metrics.log_summary()
 
         return full_text.strip()
 
-    def speak_text(self, text: str) -> bool:
-        return bool(self.speak_stream(iter([text.strip()])))
+    def _prewarm_connection(self, synthesizer) -> None:
+        """在等待 LLM 首 token 的空窗里提前打开 TTS websocket。
+
+        DashScope tts_v2 的 websocket 为懒连接（首次 streaming_call 才握手），没有公开的
+        “只建连”接口。这里用一个空白占位触发建连：空白不含音素、不产生可听音频，且 _warming
+        期间回调会丢弃一切数据/错误，确保零副作用。若 SDK 拒绝空白调用，吞掉异常退回懒连接
+        （行为与改动前一致）。
+        """
+        try:
+            synthesizer.streaming_call(" ")
+            logger.debug("TTS websocket 预热完成（已提前建连）")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("TTS websocket 预热跳过，退回懒连接: %s", exc)
+        finally:
+            self._prewarm_done.set()
+
+    def _activate_real_audio(self) -> None:
+        """切到真实音频阶段：先等预热建连结束，再解除门控放行真实音频。
+
+        这样既保证真实片段的 streaming_call 不与预热线程并发，又让回调开始接收真实音频。
+        """
+        self._prewarm_done.wait(timeout=2.0)
+        self._warming.clear()
 
     def interrupt(self) -> None:
         self.interrupt_event.set()
@@ -461,6 +528,7 @@ class DashScopeStreamingTTSPlayer:
         pending_audio = bytearray()
         bytes_per_second = self.config.sample_rate * self.config.channels * self.config.sample_width_bytes
         min_buffer_bytes = max(1, int(bytes_per_second * self.config.playback_buffer_ms / 1000))
+        first_non_silent_seen = False
         try:
             while not self.interrupt_event.is_set():
                 try:
@@ -469,6 +537,11 @@ class DashScopeStreamingTTSPlayer:
                     logger.warning("流式 TTS 音频队列等待超时")
                     break
                 if item_type == "audio" and isinstance(data, bytes):
+                    if not first_non_silent_seen:
+                        data = self._strip_leading_silence(data)
+                        if not data:
+                            continue
+                        first_non_silent_seen = True
                     pending_audio.extend(data)
                     # DashScope callback 可能给很碎的小 PCM 块，先攒到很短的播放缓冲再写入，
                     # 兼顾首字延迟和 Windows waveOut 小块播放的稳定性。
@@ -499,6 +572,70 @@ class DashScopeStreamingTTSPlayer:
             self.config.metrics.playback_first_write_time = time.time()
         return self._player.write(data)
 
+    def _strip_leading_silence(self, pcm_data: bytes) -> bytes:
+        """
+        丢弃 TTS 首包里的前导静音，并把首个非静音 PCM 到达时间作为更诚实的 TTS 起点。
+
+        DashScope 首包可能先吐出一小段静音；如果直接写入 waveOut，日志会显示已经“首字播放”，
+        但用户耳朵还没听到声音。这里按 10ms 小窗做 RMS 检测，只裁最前面的静音。
+        """
+        if not pcm_data:
+            return b""
+        if audioop is None:
+            if self.config.metrics.tts_first_non_silent_audio_time is None:
+                self.config.metrics.tts_first_non_silent_audio_time = time.time()
+            return pcm_data
+
+        frame_bytes = (
+            self.config.sample_rate
+            * self.config.channels
+            * self.config.sample_width_bytes
+            * self.config.leading_silence_probe_ms
+            // 1000
+        )
+        frame_bytes = max(self.config.sample_width_bytes, frame_bytes)
+        # 保持 16-bit PCM 帧对齐，避免 audioop.rms 读到半个采样。
+        frame_bytes -= frame_bytes % self.config.sample_width_bytes
+        frame_bytes = max(self.config.sample_width_bytes, frame_bytes)
+
+        for offset in range(0, len(pcm_data), frame_bytes):
+            frame = pcm_data[offset : offset + frame_bytes]
+            if len(frame) < self.config.sample_width_bytes:
+                break
+            try:
+                rms = audioop.rms(frame, self.config.sample_width_bytes)
+            except Exception:  # noqa: BLE001
+                rms = self.config.silence_rms_threshold + 1
+            if rms >= self.config.silence_rms_threshold:
+                inner_offset = self._first_loud_sample_offset(frame)
+                trim_offset = offset + inner_offset
+                if self.config.metrics.tts_first_non_silent_audio_time is None:
+                    self.config.metrics.tts_first_non_silent_audio_time = time.time()
+                if trim_offset:
+                    trimmed_ms = trim_offset / (
+                        self.config.sample_rate
+                        * self.config.channels
+                        * self.config.sample_width_bytes
+                        / 1000
+                    )
+                    logger.debug("已裁剪 TTS 前导静音 %.1fms", trimmed_ms)
+                return pcm_data[trim_offset:]
+        return b""
+
+    def _first_loud_sample_offset(self, pcm_frame: bytes) -> int:
+        """在已命中的 RMS 小窗内精确到采样点，避免保留半窗前导静音。"""
+        width = self.config.sample_width_bytes
+        if audioop is None:
+            return 0
+        sample_count = len(pcm_frame) // width
+        for sample_index in range(sample_count):
+            try:
+                if abs(audioop.getsample(pcm_frame, width, sample_index)) >= self.config.silence_rms_threshold:
+                    return sample_index * width
+            except Exception:  # noqa: BLE001
+                return 0
+        return 0
+
     def _wait_playback_done(self) -> None:
         if self._playback_thread and self._playback_thread.is_alive():
             self._playback_thread.join(timeout=30)
@@ -515,6 +652,15 @@ class DashScopeStreamingTTSPlayer:
                 break
 
     def _pop_flush_chunk(self, buffer: str, has_flushed_text: bool) -> tuple[str | None, str]:
+        # 首片太短（如“成都”“推荐”）时，TTS 服务端常要等更多上下文才吐有效 PCM。
+        # 因此首片不再 1 个字就提交，而是攒到一个可发音短语，通常能降低 TTS 首字生成等待。
+        if (
+            not has_flushed_text
+            and self.config.immediate_first_chunk
+            and len(buffer.strip()) >= self.config.immediate_first_chunk_min_chars
+        ):
+            return buffer.strip(), ""
+
         chunk, rest = self._pop_sentence(buffer, has_flushed_text)
         if chunk:
             return chunk, rest

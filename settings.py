@@ -1,5 +1,8 @@
 """
-最小语音闭环配置加载。
+配置加载。
+
+从 .env 读取 DashScope / DeepSeek 的 API key 与模型名，集中提供给各模块。
+只加载环境变量，不把任何 key 写入代码或日志。
 """
 
 from __future__ import annotations
