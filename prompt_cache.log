@@ -1,0 +1,61 @@
+(AIoT) PS C:\Users\bruce\Desktop\嵌入式竞赛\2026AIoT-master> python main_cli.py --wake-loop --wake-rounds 3
+INFO:wake_loop:持续监听已启动，触发词: 小智 / 小志 / 小知 / 小子 / 你好 / hello / hi / 开始对话
+INFO:wake_loop:第一版会在完成 3 轮对话后退出，便于验证资源释放
+INFO:wake_loop:待机监听中，请说触发词
+INFO:streaming_voice:实时 ASR 已启动，请开始说话，最长 10 秒
+INFO:streaming_voice:本地 VAD 检测到语音活动（开口确认耗时 0.914s）
+INFO:streaming_voice:本地静音超过 0.6 秒，判定用户输入完成
+INFO:streaming_voice:实时 ASR 完整句子: Hello.
+INFO:wake_loop:待机识别文本: Hello.
+INFO:wake_loop:已唤醒，先播放确认提示
+INFO:prompt_audio_cache:播放本地提示音缓存: C:\Users\bruce\Desktop\嵌入式竞赛\2026AIoT-master\data\runtime\prompt_cache\prompt_ff37e8d45c5fb893.wav
+INFO:audio_output:已通过 Windows winsound 播放音频: C:\Users\bruce\Desktop\嵌入式竞赛\2026AIoT-master\data\runtime\prompt_cache\prompt_ff37e8d45c5fb893.wav
+INFO:wake_loop:请说出问题或继续追问
+INFO:wake_loop:开始第 1/3 次用户问题监听，开头静音上限 8.0 秒
+INFO:streaming_voice:实时 ASR 已启动，请开始说话，最长 18 秒
+INFO:streaming_voice:本地 VAD 检测到语音活动（开口确认耗时 2.115s）
+INFO:streaming_voice:本地静音超过 0.6 秒，判定用户输入完成
+INFO:streaming_voice:实时 ASR 完整句子: 成都今天天气怎么样啊？
+INFO:wake_loop:投机 LLM 预取命中，终态文本: 成都今天天气怎么样啊？
+INFO:wake_loop:已识别问题，开始生成回复
+INFO:wake_loop:本轮携带短期上下文消息数: 0
+INFO:streaming_voice:用户输入文本: 成都今天天气怎么样啊？
+INFO:streaming_voice:投机 LLM 首 token 到达: 3.667s
+成都今日天气：多云，气温20到28度，适合出门活动。
+INFO:streaming_tts:系统响应时延 t=1.207s，等级=优秀（首音=应答词）
+INFO:streaming_tts:ASR 端点确认延迟（用户停声->服务端句尾）: 0.893s
+INFO:streaming_tts:LLM 首 token 延迟: 3.67s
+INFO:wake_loop:第 1 轮对话完成，保持激活状态继续听追问
+INFO:wake_loop:请说出问题或继续追问
+INFO:wake_loop:开始第 1/3 次用户问题监听，开头静音上限 8.0 秒
+INFO:streaming_voice:实时 ASR 已启动，请开始说话，最长 18 秒
+INFO:streaming_voice:本地 VAD 检测到语音活动（开口确认耗时 2.714s）
+INFO:streaming_voice:本地静音超过 0.6 秒，判定用户输入完成
+INFO:streaming_voice:实时 ASR 完整句子: 那附近有没有是好玩的公园推荐？
+INFO:wake_loop:投机 LLM 预取丢弃，投机文本=那附近有没有是好玩的公园？，终态文本=那附近有没有是好玩的公园推荐？
+INFO:wake_loop:已识别问题，开始生成回复
+INFO:wake_loop:本轮携带短期上下文消息数: 2
+INFO:streaming_voice:用户输入文本: 那附近有没有是好玩的公园推荐？
+INFO:streaming_voice:开始 DeepSeek 流式回复
+成都市区公园推荐：人民公园喝盖碗茶、武侯祠逛古园、浣花溪赏绿植，都离得不远。
+INFO:streaming_tts:系统响应时延 t=1.078s，等级=优秀（首音=应答词）
+INFO:streaming_tts:ASR 端点确认延迟（用户停声->服务端句尾）: 0.761s
+INFO:streaming_tts:LLM 首 token 延迟: 2.86s
+INFO:wake_loop:第 2 轮对话完成，保持激活状态继续听追问
+INFO:wake_loop:请说出问题或继续追问
+INFO:wake_loop:开始第 1/3 次用户问题监听，开头静音上限 8.0 秒
+INFO:streaming_voice:实时 ASR 已启动，请开始说话，最长 18 秒
+INFO:streaming_voice:本地 VAD 检测到语音活动（开口确认耗时 2.215s）
+INFO:streaming_voice:本地静音超过 0.6 秒，判定用户输入完成
+INFO:streaming_voice:实时 ASR 完整句子: 有没有适合带老人去的呢？
+INFO:wake_loop:投机 LLM 预取丢弃，投机文本=有没有适合带老人？，终态文本=有没有适合带老人去的呢？
+INFO:wake_loop:已识别问题，开始生成回复
+INFO:wake_loop:本轮携带短期上下文消息数: 4
+INFO:streaming_voice:用户输入文本: 有没有适合带老人去的呢？
+INFO:streaming_voice:开始 DeepSeek 流式回复
+带老人推荐浣花溪公园，平路多、绿树成荫，方便散步；人民公园也有茶馆休息区。
+INFO:streaming_tts:系统响应时延 t=1.131s，等级=优秀（首音=应答词）
+INFO:streaming_tts:ASR 端点确认延迟（用户停声->服务端句尾）: 0.829s
+INFO:streaming_tts:LLM 首 token 延迟: 3.65s
+INFO:wake_loop:第 3 轮对话完成，保持激活状态继续听追问
+INFO:wake_loop:持续监听验证完成，共完成 3 轮

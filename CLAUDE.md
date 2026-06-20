@@ -104,3 +104,9 @@ python -m py_compile main_cli.py wake_loop.py streaming_voice.py streaming_tts.p
 
 - 代码注释与文档使用中文，技术术语和标识符保持原文。
 - 修改主线代码后同步更新 `.codex/任务进度面板.md`、`.codex/开发计划.md`，必要时同步 `.codex/当前实现逻辑.md`。
+
+## Claude Code 工具调用安全规则
+
+绝不在正文中手写、拼接或复述 `(tool_use) name=... id=toolu... input={...}` 这类工具调用文本。工具调用必须作为 Claude Code 结构化工具调用块发出；说明文字和工具调用要分离，不要把多个 Read/Bash 调用挤在同一段正文里。
+
+如果需要连续读取多个文件，优先使用一个只读 Bash/PowerShell 命令完成，或发出多个独立的真实 Read 工具调用块。若发现工具调用已被打印成普通文本，应立即改用真实工具调用重新执行，不要等待用户提醒。

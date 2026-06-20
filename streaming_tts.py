@@ -41,20 +41,36 @@ class StreamingTTSMetrics:
     tts_first_audio_time: float | None = None
     tts_first_non_silent_audio_time: float | None = None
     playback_first_write_time: float | None = None
+    # 是否在 LLM 内容前先合成了即时应答词（“好的/嗯”）。应答词现在作为同一条流式 TTS 的
+    # 第一个文本片段，与内容同音色、同 PCM 流连续播出，因此它的首音就是 playback_first_write_time。
+    # 这里只用作日志标注“首音=应答词/LLM 内容首字”，不再单独记时间。
+    ack_word_used: bool = False
     text_done_time: float | None = None
 
     def log_summary(self) -> None:
         # 比赛要求显示“用户语句结束 -> TTS 播报第一个字”的时延。
-        # 这里用“裁掉前导静音后的首个非静音 PCM 写入”近似首字真正进入播放设备，
-        # 比首包到达或 waveOut 纯入队更接近评委听到声音的起点。
+        # 终点统一用“裁掉前导静音后的首个非静音 PCM 写入”，即用户最先听到的声音；
+        # 当启用应答词时，该首音就是应答词（已并入同一条流式 TTS），口径与“测到应答词首音”一致。
         if self.utterance_end_time and self.playback_first_write_time:
             latency = max(0.0, self.playback_first_write_time - self.utterance_end_time)
-            logger.info("系统响应时延 t=%.3fs，等级=%s", latency, self.competition_level(latency))
+            audible_source = "应答词" if self.ack_word_used else "LLM 内容首字"
+            logger.info(
+                "系统响应时延 t=%.3fs，等级=%s（首音=%s）",
+                latency,
+                self.competition_level(latency),
+                audible_source,
+            )
         if self.asr_endpoint_confirm_delay is not None:
             logger.info("ASR 端点确认延迟（用户停声->服务端句尾）: %.3fs", self.asr_endpoint_confirm_delay)
         if self.llm_first_token_time:
             logger.info("LLM 首 token 延迟: %.2fs", self.llm_first_token_time - self.llm_start_time)
-        if self.tts_first_text_submit_time and self.playback_first_write_time:
+        # 启用应答词时 playback_first_write_time 被本地预灌的应答词 PCM 锚定（远早于 LLM 内容
+        # 文本提交），这条相减会变负且无意义；只在无应答词时衡量纯内容链路的 TTS 首片→首音。
+        if (
+            not self.ack_word_used
+            and self.tts_first_text_submit_time
+            and self.playback_first_write_time
+        ):
             logger.info("TTS 首片到首个非静音 PCM: %.3fs", self.playback_first_write_time - self.tts_first_text_submit_time)
 
     @staticmethod
@@ -81,6 +97,8 @@ class StreamingTTSConfig:
     silence_rms_threshold: int = 80
     queue_timeout_seconds: float = 10.0
     linux_card_name: str = "lahainayupikiot"
+    # 应答词 PCM 与 LLM 内容之间插入的停顿时长，制造自然换气间隔，避免“好的成都今日…”连读。
+    ack_gap_ms: int = 350
     metrics: StreamingTTSMetrics = field(default_factory=StreamingTTSMetrics)
 
 
@@ -371,11 +389,13 @@ class DashScopeStreamingTTSPlayer:
         asr_endpoint_confirm_delay: float | None = None,
         llm_start_time: float | None = None,
         llm_first_token_time: float | None = None,
+        ack_pcm: bytes | None = None,
     ) -> str:
         if not self.api_key:
             logger.error("未配置 DASHSCOPE_API_KEY，无法执行流式 TTS")
             return ""
 
+        ack_pcm = ack_pcm or b""
         self.interrupt_event.clear()
         self._clear_audio_queue()
         self.config.metrics = StreamingTTSMetrics(
@@ -383,6 +403,7 @@ class DashScopeStreamingTTSPlayer:
             utterance_end_time=utterance_end_time,
             asr_endpoint_confirm_delay=asr_endpoint_confirm_delay,
             llm_first_token_time=llm_first_token_time,
+            ack_word_used=bool(ack_pcm),
         )
 
         if not self._start_playback_thread():
@@ -435,6 +456,27 @@ class DashScopeStreamingTTSPlayer:
             threading.Thread(
                 target=self._prewarm_connection, args=(synthesizer,), daemon=True
             ).start()
+
+            # 即时应答词：用本地预合成的 PCM 直接灌进同一条播放队列，而不是送文本给服务端。
+            # 关键原因：cosyvoice 服务端会攥住过短的首片（如“好的”），等到更多上下文才吐 PCM，
+            # 导致应答词被压到 LLM 内容之后一起念出（实测 t 无改善、且与内容连读无停顿）。
+            # 本地 PCM 同采样率/声道/位宽（22050/mono/16bit），与流式内容同音色、同后端、零网络等待，
+            # 用户停声后几乎立即出声，其写入即 playback_first_write_time（官方 t 终点）。
+            # 之后追加一段受控静音形成自然停顿，避免应答词和内容连读的突兀感。
+            if ack_pcm and not self.interrupt_event.is_set():
+                self._activate_real_audio()
+                self.audio_queue.put(("audio", ack_pcm))
+                gap_bytes = int(
+                    self.config.sample_rate
+                    * self.config.channels
+                    * self.config.sample_width_bytes
+                    * self.config.ack_gap_ms
+                    / 1000
+                )
+                gap_bytes -= gap_bytes % self.config.sample_width_bytes
+                if gap_bytes > 0:
+                    self.audio_queue.put(("audio", b"\x00" * gap_bytes))
+                logger.debug("已预灌应答词 PCM %d 字节 + 停顿 %dms", len(ack_pcm), self.config.ack_gap_ms)
 
             for piece in text_stream:
                 if self.interrupt_event.is_set():

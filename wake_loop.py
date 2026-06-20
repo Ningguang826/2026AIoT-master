@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,6 +39,20 @@ class WakeLoopConfig:
     trigger_words: tuple[str, ...] = ("小智", "小志", "小知", "小子", "你好", "hello", "hi", "开始对话")
     wake_reply: str = "你好，我在。"
     unclear_reply: str = "不好意思呀，我刚才没听清，可以再说一遍吗？"
+    # 即时应答词：识别到有效问题后、LLM 内容播报前先播一个，填补 LLM 首 token 空窗、降低体感时延。
+    # 实现上预合成为本地 PCM，直接灌进流式 TTS 同一条播放队列立即出声（绕开 cosyvoice 服务端
+    # 攥住过短首片的延迟），再追加一小段静音停顿后接 LLM 内容，与内容同音色、同采样率无缝衔接。
+    # DeepSeek 首 token 约 2~3.5s，应答词需足够长才能覆盖空窗，故用整句口语填充而非“好的/嗯”。
+    # 随机选一个避免每轮重复。enable_ack_word=False 可关闭做时延对照（按 LLM 内容首字计时）。
+    ack_words: tuple[str, ...] = (
+        "好的，让我想一想啊。",
+        "嗯嗯，这个问题我来看看。",
+        "好嘞，让我帮你查一下。",
+        "好的，稍等我一下下。",
+        "嗯嗯，我了解了，我想想。"
+        "好的，我明白了，让我来回答你。",
+    )
+    enable_ack_word: bool = True
     listen_seconds: int = 10
     question_seconds: int = 18
     question_initial_silence_seconds: float = 8.0
@@ -77,6 +92,10 @@ class WakeLoop:
         else:
             logger.info("当前为持续运行模式，按 Ctrl+C 退出")
         self.voice_loop.warmup_prompt_audio(self.config.wake_reply, self.config.unclear_reply)
+        if self.config.enable_ack_word and self.config.ack_words:
+            # 预生成应答词 wav 缓存：speak_stream 用其 raw PCM 直接灌播放队列（绕开 cosyvoice
+            # 服务端攥住过短首片的问题），启动时预热可让第一轮就命中本地缓存，不必等在线 TTS。
+            self.voice_loop.warmup_prompt_audio(*self.config.ack_words)
 
         while self.config.max_rounds <= 0 or completed_rounds < self.config.max_rounds:
             try:
@@ -170,12 +189,18 @@ class WakeLoop:
             # answer_text 内部同步完成 TTS 播放；播放期间不再启动监听，保证录音和播放互斥。
             self.config.state = WakeState.SPEAKING
             logger.info("本轮携带短期上下文消息数: %s", len(dialog_history))
+            ack_word = (
+                random.choice(self.config.ack_words)
+                if self.config.enable_ack_word and self.config.ack_words
+                else None
+            )
             reply = self.voice_loop.answer_text(
                 user_text,
                 history=dialog_history,
                 utterance_end_time=result.utterance_end_time,
                 asr_endpoint_confirm_delay=result.endpoint_confirm_delay,
                 prefetched_stream=result.prefetched_stream,
+                ack_word=ack_word,
             )
             if not reply:
                 self.config.state = WakeState.ERROR_RECOVERY
@@ -416,3 +441,5 @@ class WakeLoop:
             if same_count >= len(trigger) - 1:
                 return True
         return False
+
+

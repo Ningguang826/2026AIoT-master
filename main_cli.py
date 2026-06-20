@@ -67,6 +67,17 @@ def parse_args() -> argparse.Namespace:
         default="不好意思呀，我刚才没听清，可以再说一遍吗？",
         help="唤醒后未听清问题时播放的兜底提示语",
     )
+    parser.add_argument(
+        "--ack-words",
+        default="",
+        help="逗号分隔的即时应答词，识别到问题后随机选一个先播，填补 LLM 首 token 空窗；"
+        "留空则用 WakeLoopConfig 内置的整句口语填充词",
+    )
+    parser.add_argument(
+        "--no-ack-word",
+        action="store_true",
+        help="关闭即时应答词，仅按 LLM 内容首字计时（用于时延对照）",
+    )
     return parser.parse_args()
 
 
@@ -78,12 +89,15 @@ def main() -> int:
         logger.info("当前主线只保留持续唤醒入口，已自动按 --wake-loop 启动")
 
     trigger_words = tuple(word.strip() for word in args.wake_words.split(",") if word.strip())
+    ack_words = tuple(word.strip() for word in args.ack_words.split(",") if word.strip())
     wake_loop = WakeLoop(
         settings,
         WakeLoopConfig(
             trigger_words=trigger_words or ("小智", "小志", "小知", "小子", "你好", "hello", "hi", "开始对话"),
             wake_reply=args.wake_reply,
             unclear_reply=args.unclear_reply,
+            ack_words=ack_words or WakeLoopConfig().ack_words,
+            enable_ack_word=not args.no_ack_word,
             listen_seconds=args.wake_listen_seconds,
             question_seconds=args.wake_question_seconds,
             question_initial_silence_seconds=args.wake_initial_silence_seconds,
@@ -98,3 +112,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

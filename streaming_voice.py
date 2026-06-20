@@ -496,6 +496,7 @@ class RealtimeVoiceLoop:
         utterance_end_time: float | None = None,
         asr_endpoint_confirm_delay: float | None = None,
         prefetched_stream: SpeculativeLLMStream | None = None,
+        ack_word: str | None = None,
     ) -> str:
         """复用同一条流式 LLM + 分句 TTS 链路，供实时入口和持续监听入口调用。"""
         logger.info("用户输入文本: %s", user_text)
@@ -509,6 +510,17 @@ class RealtimeVoiceLoop:
             text_stream = self.llm.stream_reply(user_text, history=history)
             llm_start_time = None
             llm_first_token_time = None
+        # 即时应答词改为本地预合成 PCM：用同一个 cosyvoice voice 生成的缓存 wav 解析出 raw PCM
+        # （与流式内容同 22050Hz/mono/16bit），由 speak_stream 直接灌入同一条播放队列。
+        # 这样既绕开“cosyvoice 服务端攥住过短首片”导致应答词无法提前出声的问题（用户停声后
+        # 几乎立刻听到），又因同音色、同后端而无切换突兀；应答词后接受控静音形成自然停顿。
+        ack_pcm: bytes | None = None
+        if ack_word and ack_word.strip():
+            ack_pcm = self.prompt_audio_cache.load_pcm(
+                ack_word, expected_sample_rate=self.streaming_tts_player.config.sample_rate
+            )
+            if not ack_pcm:
+                logger.warning("应答词本地 PCM 不可用，本轮跳过应答词: %s", ack_word)
         with self.audio_session.speaking() as can_speak:
             if not can_speak:
                 logger.error("音频设备正忙，无法播放回复")
@@ -519,6 +531,7 @@ class RealtimeVoiceLoop:
                 asr_endpoint_confirm_delay=asr_endpoint_confirm_delay,
                 llm_start_time=llm_start_time,
                 llm_first_token_time=llm_first_token_time,
+                ack_pcm=ack_pcm,
             )
         if not reply:
             logger.error("LLM 未生成有效回复")

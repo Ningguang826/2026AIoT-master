@@ -137,6 +137,67 @@ class PromptAudioCache:
             return None
         return wav_path
 
+    def load_pcm(self, text: str, expected_sample_rate: int = 22050) -> bytes | None:
+        """
+        确保提示语缓存存在后，解析出 raw PCM（去 WAV 头，仅 data chunk）。
+
+        应答词缓存用 WAV_22050HZ_MONO_16BIT 生成，与流式 TTS 的
+        PCM_22050HZ_MONO_16BIT 同采样率/声道/位宽，可直接灌进同一条播放队列，
+        绕开“cosyvoice 服务端攥住过短首片”导致的应答词延迟。
+        """
+        prompt = text.strip()
+        if not prompt:
+            return None
+        wav_path = self.ensure(prompt)
+        if not wav_path:
+            return None
+        try:
+            pcm, sample_rate, channels, sample_width = self._extract_pcm(wav_path.read_bytes())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("应答词 PCM 解析失败 %s: %s", wav_path, exc)
+            return None
+        if not pcm:
+            logger.warning("应答词 PCM 为空: %s", wav_path)
+            return None
+        if (sample_rate, channels, sample_width) != (expected_sample_rate, 1, 2):
+            logger.warning(
+                "应答词 PCM 格式不匹配（%sHz/%sch/%sB，期望 %sHz/1ch/2B），跳过本地预灌",
+                sample_rate,
+                channels,
+                sample_width,
+                expected_sample_rate,
+            )
+            return None
+        return pcm
+
+    @staticmethod
+    def _extract_pcm(wav_bytes: bytes) -> tuple[bytes, int, int, int]:
+        """从 WAV 字节解析出 (raw_pcm, sample_rate, channels, sample_width_bytes)。"""
+        if len(wav_bytes) < 44 or wav_bytes[0:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
+            raise ValueError("非法 WAV 头")
+        sample_rate = channels = sample_width = 0
+        pcm = b""
+        offset = 12
+        while offset + 8 <= len(wav_bytes):
+            chunk_id = wav_bytes[offset : offset + 4]
+            chunk_size = struct.unpack_from("<I", wav_bytes, offset + 4)[0]
+            data_start = offset + 8
+            if chunk_id == b"fmt ":
+                channels = struct.unpack_from("<H", wav_bytes, data_start + 2)[0]
+                sample_rate = struct.unpack_from("<I", wav_bytes, data_start + 4)[0]
+                bits_per_sample = struct.unpack_from("<H", wav_bytes, data_start + 14)[0]
+                sample_width = bits_per_sample // 8
+            elif chunk_id == b"data":
+                # DashScope 偶尔把 data 长度写成占位值，按文件实际剩余长度兜底。
+                actual = len(wav_bytes) - data_start
+                size = chunk_size if 0 < chunk_size <= actual else actual
+                pcm = wav_bytes[data_start : data_start + size]
+                break
+            if chunk_size <= 0 or data_start + chunk_size > len(wav_bytes):
+                break
+            offset = data_start + chunk_size + (chunk_size % 2)
+        return pcm, sample_rate, channels, sample_width
+
     def _cache_path(self, text: str) -> Path:
         cache_key = "|".join([self.tts_generator.model, self.tts_generator.voice, text])
         digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:16]
